@@ -28,14 +28,19 @@ chown stephen-perry:stephen-perry /mnt/bulk
 chown stephen-perry:stephen-perry /mnt/containers/podman
 
 echo "== 2. Docker (data-root -> /mnt/containers/docker) =="
-apt-get install -y docker.io
+# daemon.json must exist BEFORE install: the docker.io postinst script starts
+# dockerd immediately, and "systemctl enable --now" on an already-running
+# service does not restart it, so a config written after install is ignored
+# until a manual restart.
 mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<'EOF'
 {
   "data-root": "/mnt/containers/docker"
 }
 EOF
-systemctl enable --now docker
+apt-get install -y docker.io
+systemctl restart docker
+systemctl enable docker
 usermod -aG docker stephen-perry
 
 echo "== 3. Podman (rootless, graphroot -> /mnt/containers/podman) =="
