@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "== 1. Persistent mounts (sdb=bulk, sdc=backup, sdd=containers) =="
-mkdir -p /mnt/bulk /mnt/containers/docker /mnt/containers/podman /mnt/backup
+mkdir -p /mnt/bulk /mnt/backup /mnt/containers
 
 if ! grep -q "sdb/sdc/sdd repurposing" /etc/fstab; then
 cat >> /etc/fstab <<'EOF'
@@ -14,10 +14,15 @@ UUID=f154e9f7-6f70-4108-b916-6f1d863f0245  /mnt/containers  ext4  defaults,noati
 EOF
 fi
 
+systemctl daemon-reload
+
 umount /run/media/stephen-perry/dev1 2>/dev/null || true
 umount /run/media/stephen-perry/data1 2>/dev/null || true
 umount /run/media/stephen-perry/dev2 2>/dev/null || true
 mount -a
+
+# docker/podman subdirs must be created AFTER mount -a, or the mount hides them
+mkdir -p /mnt/containers/docker /mnt/containers/podman
 
 chown stephen-perry:stephen-perry /mnt/bulk
 chown stephen-perry:stephen-perry /mnt/containers/podman
