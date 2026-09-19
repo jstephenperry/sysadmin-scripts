@@ -14,3 +14,6 @@ touches disks, partitions, or encryption. Use at your own risk.
 
 - `linux/disk-cloning/`: scripts for cloning a LUKS-encrypted Linux disk to a
   larger drive from a live USB session (identify drives, then clone/resize).
+- `linux/disk-tools/`: a scoped sudoers drop-in for disk diagnostics/repair,
+  and a setup script that repurposes secondary drives as bulk storage,
+  container image storage, and a restic-backed backup target.

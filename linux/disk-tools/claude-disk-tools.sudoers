@@ -1,0 +1,37 @@
+# Managed for j.stephen.perry — least-privilege sudo for disk diagnosis/repair.
+# Full paths only (no bare command names) so PATH manipulation can't hijack these rules.
+# Destroy-capable tools (dd, mkfs*, wipefs, sgdisk, parted write-subcommands, shred) are
+# deliberately NOT listed here — those still require an interactive password every time.
+
+# --- Tier 1: read-only diagnostics, safe to run unattended ---
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/hdparm -I *
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/lsblk, /usr/bin/lsblk *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/blkid, /usr/sbin/blkid *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/fdisk -l, /usr/sbin/fdisk -l *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/parted -l
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/df, /usr/bin/df *
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/dmesg, /usr/bin/dmesg *
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/journalctl *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/badblocks -n *, /usr/sbin/badblocks -v -n *
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/iostat, /usr/bin/iostat *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/smartctl -a *, /usr/sbin/smartctl --all *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/smartctl -H *, /usr/sbin/smartctl -t *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/smartctl -x *, /usr/sbin/smartctl --xall *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/tune2fs -l *
+
+# --- Tier 2: repair/mount operations that change disk state.
+# Claude will always show you `lsblk`/`df` output identifying the target device
+# immediately before running one of these — not run blind.
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/fsck *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/e2fsck *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/resize2fs *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/dosfsck *
+stephen-perry ALL=(root) NOPASSWD: /usr/sbin/tune2fs *
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/mount *
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/umount *
+
+# --- Tier 3: package installs, scoped to disk-diagnostic tooling only ---
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/apt-get install -y smartmontools
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/apt-get install smartmontools
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/apt-get install -y nvme-cli
+stephen-perry ALL=(root) NOPASSWD: /usr/bin/apt-get install nvme-cli
