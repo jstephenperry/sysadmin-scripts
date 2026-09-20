@@ -76,6 +76,7 @@ Description=Restic backup of home + /etc to sdc
 
 [Service]
 Type=oneshot
+Environment=HOME=/root
 ExecStart=/usr/bin/restic -r /mnt/backup/restic-repo --password-file /etc/restic/password backup /home/stephen-perry /etc --exclude-file=/etc/restic/excludes.txt
 ExecStartPost=/usr/bin/restic -r /mnt/backup/restic-repo --password-file /etc/restic/password forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
 EOF
