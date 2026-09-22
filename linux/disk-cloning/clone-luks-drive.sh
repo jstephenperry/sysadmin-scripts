@@ -334,9 +334,56 @@ echo "This must be the LAST partition on the disk for the resize below to work."
 read -rp "Grow partition $PART_NUM to fill the rest of $TARGET now? [y/N] " GO
 [[ "$GO" =~ ^[Yy]$ ]] || { echo "Stopping before partition resize."; exit 1; }
 
-parted -s "$TARGET" resizepart "$PART_NUM" 100%
+# Do NOT use "resizepart 100%" here. That ends the partition at the last
+# usable LBA, which sits 34 sectors below the end of the disk and so almost
+# never lands on a 4096-byte boundary. dm-crypt rejects any mapping whose
+# length in 512-byte sectors is not a multiple of its sector_size feature,
+# so on a LUKS2 container formatted with a 4096-byte encryption sector the
+# luksOpen further down then fails with:
+#   device-mapper: reload ioctl on ... failed: Invalid argument
+#   The device size is not multiple of the requested sector size.
+# Round the end down to a whole number of encryption sectors instead. The
+# few KB given up at the end of the disk are irrelevant.
+# "|| true" on each of these: under "set -e" with pipefail a failing
+# luksDump or sgdisk would abort the script outright, making the fallback
+# below unreachable.
+LUKS_SECTOR=$(cryptsetup luksDump "$LUKS_PART" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*sector:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -n1 || true)
+# LUKS1 has no sector field and is always 512.
+[[ "$LUKS_SECTOR" =~ ^[0-9]+$ ]] && (( LUKS_SECTOR > 0 )) || LUKS_SECTOR=512
+LOGICAL_SECTOR=$(blockdev --getss "$TARGET")
+GRAIN=$(( LUKS_SECTOR / LOGICAL_SECTOR ))
+(( GRAIN > 0 )) || GRAIN=1
+
+PART_START=$(sgdisk -i "$PART_NUM" "$TARGET" 2>/dev/null \
+    | sed -n 's/^First sector: \([0-9]\{1,\}\).*/\1/p' || true)
+LAST_USABLE=$(sgdisk -p "$TARGET" 2>/dev/null \
+    | sed -n 's/.*last usable sector is \([0-9]\{1,\}\).*/\1/p' || true)
+
+echo "LUKS encryption sector size: ${LUKS_SECTOR} bytes (alignment grain: $GRAIN sectors)"
+
+if [[ "$PART_START" =~ ^[0-9]+$ && "$LAST_USABLE" =~ ^[0-9]+$ ]]; then
+    NEW_SECTORS=$(( LAST_USABLE - PART_START + 1 ))
+    NEW_SECTORS=$(( NEW_SECTORS - NEW_SECTORS % GRAIN ))
+    NEW_END=$(( PART_START + NEW_SECTORS - 1 ))
+    echo "Growing partition $PART_NUM to sectors $PART_START-$NEW_END" \
+         "($(numfmt --to=iec $(( NEW_SECTORS * LOGICAL_SECTOR ))))."
+    parted -s "$TARGET" unit s resizepart "$PART_NUM" "${NEW_END}s"
+else
+    echo "Could not read partition geometry from sgdisk; falling back to 100%." >&2
+    parted -s "$TARGET" resizepart "$PART_NUM" 100%
+fi
 partprobe "$TARGET" || partx -u "$TARGET"
 sleep 2
+
+# Fail loudly here rather than letting luksOpen produce an opaque
+# device-mapper error further down.
+PART_SECTORS=$(blockdev --getsz "$LUKS_PART")
+if (( PART_SECTORS % GRAIN != 0 )); then
+    echo "Partition $LUKS_PART is $PART_SECTORS sectors, not a multiple of $GRAIN." >&2
+    echo "LUKS would refuse to open it. Aborting before any further changes." >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Open and grow the LUKS container
