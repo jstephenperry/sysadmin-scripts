@@ -10,8 +10,11 @@
 # Run this from a LIVE USB session, NOT from the installed OS.
 # The SOURCE disk is only ever READ. The TARGET disk is COMPLETELY ERASED.
 #
-# Usage: sudo ./clone-luks-drive.sh [SOURCE] [TARGET]
+# Usage: sudo ./clone-luks-drive.sh [--dry-run] [SOURCE] [TARGET]
 #        (or just run it with no args and answer the prompts)
+#
+# --dry-run prints the pre-flight plan (partition layout, LUKS sector size,
+# projected post-resize geometry) and exits without writing anything.
 #
 # SOURCE and TARGET may be given as a bare kernel name (sdc, nvme0n1), a
 # full path (/dev/sdc), or a /dev/disk/by-id symlink.
@@ -24,6 +27,13 @@ set -euo pipefail
 if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root (sudo)." >&2
     exit 1
+fi
+
+# --dry-run stops after the pre-flight plan, before anything is written.
+DRY_RUN=false
+if [[ "${1:-}" == "-n" || "${1:-}" == "--dry-run" ]]; then
+    DRY_RUN=true
+    shift
 fi
 
 # ---------------------------------------------------------------------------
@@ -236,6 +246,141 @@ fi
 if swapon --show=NAME --noheadings 2>/dev/null | grep -q "^${TARGET}"; then
     echo "TARGET is in use as swap. Aborting." >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 2c. Pre-flight plan
+# ---------------------------------------------------------------------------
+# Everything that decides whether this clone can succeed is knowable from the
+# SOURCE partition table and LUKS header plus the TARGET's size, before a
+# single byte is written. Compute the post-clone geometry here so a problem
+# surfaces now rather than after a destructive copy.
+
+# /dev/sdc + 3 -> /dev/sdc3, but /dev/nvme0n1 + 3 -> /dev/nvme0n1p3.
+partition_path() {
+    local disk="$1" num="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        printf '%sp%s' "$disk" "$num"
+    else
+        printf '%s%s' "$disk" "$num"
+    fi
+}
+
+echo
+echo "=== Pre-flight plan ==="
+
+SRC_SS=$(blockdev --getss "$SOURCE")
+TGT_SS=$(blockdev --getss "$TARGET")
+echo "Logical sector size: source ${SRC_SS}B, target ${TGT_SS}B"
+if (( SRC_SS != TGT_SS )); then
+    echo >&2
+    echo "ERROR: logical sector sizes differ. Every LBA in the copied partition" >&2
+    echo "table would be reinterpreted at the wrong scale on the target, so the" >&2
+    echo "clone would be unreadable. Aborting." >&2
+    exit 1
+fi
+
+echo
+echo "Source partition layout:"
+SRC_LUKS_PART=""
+SRC_LUKS_NUM=""
+SRC_LUKS_START=""
+SRC_LUKS_END=""
+SRC_MAX_END=0
+while read -r pnum pstart pend; do
+    [[ "$pnum" =~ ^[0-9]+$ ]] || continue
+    pdev=$(partition_path "$SOURCE" "$pnum")
+    pfs=$(blkid -s TYPE -o value "$pdev" 2>/dev/null || true)
+    printf '  %-3s %-18s %12s .. %-12s %s\n' \
+        "$pnum" "$pdev" "$pstart" "$pend" "${pfs:-(no signature)}"
+    (( pend > SRC_MAX_END )) && SRC_MAX_END=$pend
+    if [[ "$pfs" == "crypto_LUKS" ]]; then
+        SRC_LUKS_PART="$pdev"
+        SRC_LUKS_NUM="$pnum"
+        SRC_LUKS_START="$pstart"
+        SRC_LUKS_END="$pend"
+    fi
+done < <(sgdisk -p "$SOURCE" 2>/dev/null \
+    | awk '/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+/ {print $1, $2, $3}' || true)
+
+if [[ -z "$SRC_LUKS_PART" ]]; then
+    echo >&2
+    echo "ERROR: no crypto_LUKS partition found on $SOURCE. This script only" >&2
+    echo "handles a LUKS-encrypted source. Aborting." >&2
+    exit 1
+fi
+
+echo
+echo "LUKS partition: $SRC_LUKS_PART (partition $SRC_LUKS_NUM)"
+if (( SRC_LUKS_END != SRC_MAX_END )); then
+    echo >&2
+    echo "ERROR: $SRC_LUKS_PART is not the last partition on $SOURCE (it ends at" >&2
+    echo "$SRC_LUKS_END, the disk's last partition ends at $SRC_MAX_END). Growing it" >&2
+    echo "would run into the partition that follows. Aborting." >&2
+    exit 1
+fi
+echo "  Position: last partition on the disk, so it can be grown."
+
+LUKS_VERSION=$(cryptsetup luksDump "$SRC_LUKS_PART" 2>/dev/null \
+    | sed -n 's/^Version:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -n1 || true)
+LUKS_SECTOR=$(cryptsetup luksDump "$SRC_LUKS_PART" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*sector:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -n1 || true)
+# LUKS1 has no sector field and is always 512.
+[[ "$LUKS_SECTOR" =~ ^[0-9]+$ ]] && (( LUKS_SECTOR > 0 )) || LUKS_SECTOR=512
+echo "  LUKS version: ${LUKS_VERSION:-unknown}, encryption sector: ${LUKS_SECTOR}B"
+
+GRAIN=$(( LUKS_SECTOR / TGT_SS ))
+(( GRAIN > 0 )) || GRAIN=1
+
+# After the copy, sgdisk -e moves the backup GPT to the end of the larger
+# disk. The space it reserves is a property of the partition entry array,
+# which the copy carries over from the source, so measure it there rather
+# than assuming the usual 34 sectors.
+SRC_TOTAL=$(blockdev --getsz "$SOURCE")
+TGT_TOTAL=$(blockdev --getsz "$TARGET")
+SRC_LAST_USABLE=$(sgdisk -p "$SOURCE" 2>/dev/null \
+    | sed -n 's/.*last usable sector is \([0-9]\{1,\}\).*/\1/p' || true)
+if [[ "$SRC_LAST_USABLE" =~ ^[0-9]+$ ]]; then
+    GPT_RESERVE=$(( SRC_TOTAL - SRC_LAST_USABLE ))
+else
+    GPT_RESERVE=34
+fi
+PROJ_LAST_USABLE=$(( TGT_TOTAL - GPT_RESERVE ))
+
+PROJ_SECTORS=$(( PROJ_LAST_USABLE - SRC_LUKS_START + 1 ))
+PROJ_SECTORS=$(( PROJ_SECTORS - PROJ_SECTORS % GRAIN ))
+PROJ_END=$(( SRC_LUKS_START + PROJ_SECTORS - 1 ))
+CUR_SECTORS=$(( SRC_LUKS_END - SRC_LUKS_START + 1 ))
+
+echo
+echo "Projected geometry after the clone and resize:"
+printf '  %-26s %s\n' "partition start"     "$SRC_LUKS_START (unchanged)"
+printf '  %-26s %s\n' "current end"         "$SRC_LUKS_END"
+printf '  %-26s %s\n' "target last usable"  "$PROJ_LAST_USABLE (GPT reserves $GPT_RESERVE sectors)"
+printf '  %-26s %s\n' "new end"             "$PROJ_END (aligned to $GRAIN sectors)"
+printf '  %-26s %s -> %s\n' "partition size" \
+    "$(numfmt --to=iec $(( CUR_SECTORS * TGT_SS )))" \
+    "$(numfmt --to=iec $(( PROJ_SECTORS * TGT_SS )))"
+printf '  %-26s %s bytes\n' "unused tail" "$(( (PROJ_LAST_USABLE - PROJ_END) * TGT_SS ))"
+
+if (( PROJ_SECTORS % GRAIN != 0 )); then
+    echo >&2
+    echo "ERROR: projected size $PROJ_SECTORS is not a multiple of $GRAIN sectors." >&2
+    echo "LUKS would refuse to open the container. Aborting." >&2
+    exit 1
+fi
+if (( PROJ_SECTORS <= CUR_SECTORS )); then
+    echo >&2
+    echo "ERROR: the projected partition would not be larger than the current one." >&2
+    echo "There is nothing to gain from this clone. Aborting." >&2
+    exit 1
+fi
+echo "  Checks: alignment OK, partition grows, LUKS is last."
+
+if $DRY_RUN; then
+    echo
+    echo "Dry run requested (--dry-run). Nothing was written. Stopping here."
+    exit 0
 fi
 
 # Detect whether TARGET already has a partition table or filesystem on it.
