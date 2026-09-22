@@ -10,8 +10,11 @@
 # Run this from a LIVE USB session, NOT from the installed OS.
 # The SOURCE disk is only ever READ. The TARGET disk is COMPLETELY ERASED.
 #
-# Usage: sudo ./clone-luks-drive.sh [/dev/SOURCE] [/dev/TARGET]
+# Usage: sudo ./clone-luks-drive.sh [SOURCE] [TARGET]
 #        (or just run it with no args and answer the prompts)
+#
+# SOURCE and TARGET may be given as a bare kernel name (sdc, nvme0n1), a
+# full path (/dev/sdc), or a /dev/disk/by-id symlink.
 #
 set -euo pipefail
 
@@ -64,19 +67,66 @@ echo "=== Current disks ==="
 lsblk -d -o NAME,SIZE,TYPE,TRAN,MODEL,SERIAL
 echo
 
-SOURCE="${1:-}"
-TARGET="${2:-}"
+# Accept what the disk list above actually prints. lsblk shows bare kernel
+# names (sda, nvme0n1), so typing "sdc" at the prompt is the obvious thing
+# to do; requiring a full "/dev/sdc" made that a hard failure. Bare names,
+# full paths and /dev/disk/by-id style symlinks are all accepted here and
+# normalized to one canonical node path.
+normalize_device() {
+    local dev="$1" resolved
+    dev="${dev#"${dev%%[![:space:]]*}"}"    # strip leading whitespace
+    dev="${dev%"${dev##*[![:space:]]}"}"    # strip trailing whitespace
+    if [[ -z "$dev" ]]; then
+        return 1
+    fi
+    dev="${dev%/}"                          # strip a trailing slash
+    [[ "$dev" == /* ]] || dev="/dev/$dev"
+    # Resolve symlinks so SOURCE/TARGET comparisons and the confirmation
+    # prompt below all operate on the same canonical path.
+    resolved=$(readlink -f "$dev" 2>/dev/null) || resolved=""
+    if [[ -n "$resolved" ]]; then
+        dev="$resolved"
+    fi
+    printf '%s' "$dev"
+}
 
-if [[ -z "$SOURCE" ]]; then
-    read -rp "Enter SOURCE device (e.g. /dev/sda) - the OLD, smaller, LUKS drive: " SOURCE
-fi
-if [[ -z "$TARGET" ]]; then
-    read -rp "Enter TARGET device (e.g. /dev/sdb) - the NEW, larger, blank drive: " TARGET
-fi
+# Result of the last select_device call.
+DEVICE=""
 
-for dev in "$SOURCE" "$TARGET"; do
-    [[ -b "$dev" ]] || { echo "Not a block device: $dev" >&2; exit 1; }
-done
+select_device() {
+    local role="$1" prompt="$2" value="${3:-}" candidate attempt
+    for attempt in 1 2 3; do
+        if [[ -z "$value" ]]; then
+            if ! read -rp "$prompt" value; then
+                echo >&2
+                echo "No $role device provided. Aborting." >&2
+                exit 1
+            fi
+        fi
+        candidate=$(normalize_device "$value" || true)
+        if [[ -n "$candidate" && -b "$candidate" ]]; then
+            DEVICE="$candidate"
+            return 0
+        fi
+        echo "Not a usable block device: ${candidate:-<empty>}" >&2
+        echo "Pick one of the NAME values listed above, e.g. $(lsblk -dno NAME -e 7,11 2>/dev/null | head -n1)." >&2
+        # A non-interactive run (piped answers, CI) must not spin here.
+        [[ -t 0 ]] || exit 1
+        value=""
+    done
+    echo "Too many invalid entries for $role. Aborting." >&2
+    exit 1
+}
+
+select_device SOURCE \
+    "Enter SOURCE device (e.g. /dev/sda or sda) - the OLD, smaller, LUKS drive: " \
+    "${1:-}"
+SOURCE="$DEVICE"
+
+select_device TARGET \
+    "Enter TARGET device (e.g. /dev/sdb or sdb) - the NEW, larger, blank drive: " \
+    "${2:-}"
+TARGET="$DEVICE"
 
 if [[ "$SOURCE" == "$TARGET" ]]; then
     echo "SOURCE and TARGET must be different devices." >&2
@@ -137,8 +187,11 @@ else
 fi
 
 echo
-echo "Type the TARGET device path exactly to confirm it will be ERASED:"
+echo "Type the TARGET device ($TARGET) exactly to confirm it will be ERASED:"
 read -rp "> " CONFIRM
+# Normalized the same way as the selection above, so "nvme0n1" and
+# "/dev/nvme0n1" both match; anything else still aborts.
+CONFIRM=$(normalize_device "$CONFIRM" || true)
 if [[ "$CONFIRM" != "$TARGET" ]]; then
     echo "Confirmation did not match. Aborting." >&2
     exit 1
