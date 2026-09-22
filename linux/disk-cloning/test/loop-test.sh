@@ -137,8 +137,12 @@ echo "=== Running identify-drives.sh (read-only sanity check) ==="
 echo
 echo "=== Running clone-luks-drive.sh against the loop devices ==="
 echo "(answers are piped automatically: target path, y, y, passphrase, LV name)"
-printf '%s\ny\ny\n%s\nroot\n' "$LOOP_TGT" "$TEST_PASSPHRASE" | \
-    "$SCRIPT_DIR/clone-luks-drive.sh" "$LOOP_SRC" "$LOOP_TGT"
+# Deliberately passes bare kernel names (loopN, not /dev/loopN) for both the
+# arguments and the erase confirmation: that is what the script's own disk
+# listing prints, and it used to be rejected outright. This keeps that
+# regression from coming back.
+printf '%s\ny\ny\n%s\nroot\n' "${LOOP_TGT#/dev/}" "$TEST_PASSPHRASE" | \
+    "$SCRIPT_DIR/clone-luks-drive.sh" "${LOOP_SRC#/dev/}" "${LOOP_TGT#/dev/}"
 
 echo
 echo "=== Verifying the clone ==="
