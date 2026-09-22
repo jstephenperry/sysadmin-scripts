@@ -580,6 +580,24 @@ echo
 echo "Growing filesystem ($FSTYPE) on $TARGET_FS_DEV..."
 case "$FSTYPE" in
     ext2|ext3|ext4)
+        # resize2fs refuses to grow a filesystem whose last check predates
+        # its last mount ("Please run 'e2fsck -f ...' first"), which is true
+        # of every normally used root filesystem: it was checked at install
+        # and mounted on every boot since. The volume is not mounted here,
+        # so a full check is both safe and exactly what resize2fs wants.
+        echo "Checking filesystem first (resize2fs requires it)..."
+        FSCK_RC=0
+        e2fsck -fp "$TARGET_FS_DEV" || FSCK_RC=$?
+        # 0 = clean, 1 = errors corrected, 2 = corrected, reboot advised
+        # (meaningless for an offline volume). 4 and above need a human.
+        if (( FSCK_RC >= 4 )); then
+            echo >&2
+            echo "e2fsck could not repair $TARGET_FS_DEV unattended (exit $FSCK_RC)." >&2
+            echo "Run 'e2fsck -f $TARGET_FS_DEV' by hand, then re-run resize2fs:" >&2
+            echo "  resize2fs $TARGET_FS_DEV" >&2
+            exit 1
+        fi
+        (( FSCK_RC > 0 )) && echo "e2fsck corrected errors (exit $FSCK_RC); continuing."
         resize2fs "$TARGET_FS_DEV"
         ;;
     btrfs)
