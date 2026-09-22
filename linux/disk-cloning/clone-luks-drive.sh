@@ -207,7 +207,11 @@ read -rp "Proceed with the clone now? [y/N] " GO
 [[ "$GO" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
 
 if command -v pv >/dev/null 2>&1; then
-    pv -tpreb "$SOURCE" | dd of="$TARGET" bs=4M conv=fsync
+    # iflag=fullblock is required when dd reads from a pipe: without it dd
+    # accepts the pipe's short reads (64 KiB) as whole blocks and issues
+    # thousands of small writes instead of 4 MiB ones, roughly halving
+    # throughput on a fast link.
+    pv -tpreb "$SOURCE" | dd of="$TARGET" bs=4M iflag=fullblock conv=fsync
 else
     dd if="$SOURCE" of="$TARGET" bs=4M status=progress conv=fsync
 fi
