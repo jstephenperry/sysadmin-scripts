@@ -149,6 +149,85 @@ if (( TGT_SIZE < SRC_SIZE )); then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# 2b. Report the link speed each device is attached on
+# ---------------------------------------------------------------------------
+# A USB enclosure that negotiated a 480M (USB 2.0) link copies at roughly
+# 40 MB/s instead of 400+, turning a six-minute clone into an hour. Nothing
+# in lsblk, dmesg or the copy itself flags it, and the usual cause is a
+# USB 2.0 or charge-only cable, which is physically indistinguishable from
+# a SuperSpeed one. Surface it here rather than leaving it to be worked out
+# halfway through the copy.
+
+# Sets LINK_SPEED (Mbps, empty when the device is not on USB), LINK_DRIVER
+# (uas or usb-storage) and LINK_TRAN (the lsblk transport).
+LINK_SPEED=""
+LINK_DRIVER=""
+LINK_TRAN=""
+
+probe_link() {
+    local dev="$1" sysdir intf drv
+    LINK_SPEED=""
+    LINK_DRIVER=""
+    LINK_TRAN=$(lsblk -dno TRAN "$dev" 2>/dev/null | xargs || true)
+    [[ -z "$LINK_TRAN" ]] && LINK_TRAN="unknown"
+
+    sysdir=$(readlink -f "/sys/block/$(basename "$dev")" 2>/dev/null) || return 0
+    # Walk up to the owning USB device node. Only a USB device directory has
+    # both "speed" and "devnum", so this cannot match a SCSI host or the
+    # block device itself.
+    while [[ -n "$sysdir" && "$sysdir" != "/" ]]; do
+        if [[ -f "$sysdir/speed" && -f "$sysdir/devnum" ]]; then
+            LINK_SPEED=$(cat "$sysdir/speed" 2>/dev/null || true)
+            # uas vs usb-storage is a property of the interface, not the
+            # device. Read the link text rather than resolving it: the target
+            # lives outside this subtree and "readlink -f" yields nothing if
+            # any parent of it is missing.
+            for intf in "$sysdir"/*:*; do
+                if [[ -L "$intf/driver" ]]; then
+                    drv=$(readlink "$intf/driver" 2>/dev/null || true)
+                    LINK_DRIVER="${drv##*/}"
+                    break
+                fi
+            done
+            return 0
+        fi
+        sysdir=$(dirname "$sysdir")
+    done
+    return 0
+}
+
+SLOW_LINKS=""
+for role_dev in "SOURCE:$SOURCE" "TARGET:$TARGET"; do
+    role="${role_dev%%:*}"
+    probe_link "${role_dev#*:}"
+    line="$role link: $LINK_TRAN"
+    [[ -n "$LINK_SPEED" ]] && line="$line, ${LINK_SPEED}M"
+    [[ -n "$LINK_DRIVER" ]] && line="$line, driver=$LINK_DRIVER"
+    echo "$line"
+    # "speed" can read 1.5 or 12 for low/full-speed devices, so compare on
+    # the integer part only and never feed a non-integer to (( )).
+    speed_int="${LINK_SPEED%%.*}"
+    if [[ "$speed_int" =~ ^[0-9]+$ ]] && (( speed_int <= 480 )); then
+        SLOW_LINKS="$SLOW_LINKS $role"
+    fi
+done
+
+if [[ -n "$SLOW_LINKS" ]]; then
+    # 40 MB/s is what USB 2.0 bulk storage realistically sustains; the
+    # protocol ceiling is 53.2 MB/s and nothing reaches it.
+    SLOW_MINUTES=$(( SRC_SIZE / 40000000 / 60 ))
+    echo
+    echo "WARNING:$SLOW_LINKS on a USB 2.0 (480M) link."
+    echo "  USB 2.0 tops out near 40 MB/s, so copying $(numfmt --to=iec "$SRC_SIZE") will take"
+    echo "  roughly $SLOW_MINUTES minutes. On a 5000M/10000M link the same copy takes a"
+    echo "  few minutes."
+    echo "  Most common cause: a USB 2.0 or charge-only cable. Those are physically"
+    echo "  identical to SuperSpeed cables and negotiate 480M with no error anywhere."
+    echo "  Check with 'lsusb -t' and look for 5000M or 10000M on the enclosure."
+    echo "  Swapping the cable now is usually faster than waiting out the copy."
+fi
+
 # Refuse if target (or any of its partitions) is mounted or in active use.
 if lsblk -no MOUNTPOINT "$TARGET" 2>/dev/null | grep -q .; then
     echo "TARGET has a mounted partition. Unmount it first. Aborting." >&2
