@@ -10,8 +10,14 @@
 # Run this from a LIVE USB session, NOT from the installed OS.
 # The SOURCE disk is only ever READ. The TARGET disk is COMPLETELY ERASED.
 #
-# Usage: sudo ./clone-luks-drive.sh [/dev/SOURCE] [/dev/TARGET]
+# Usage: sudo ./clone-luks-drive.sh [--dry-run] [SOURCE] [TARGET]
 #        (or just run it with no args and answer the prompts)
+#
+# --dry-run prints the pre-flight plan (partition layout, LUKS sector size,
+# projected post-resize geometry) and exits without writing anything.
+#
+# SOURCE and TARGET may be given as a bare kernel name (sdc, nvme0n1), a
+# full path (/dev/sdc), or a /dev/disk/by-id symlink.
 #
 set -euo pipefail
 
@@ -21,6 +27,13 @@ set -euo pipefail
 if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root (sudo)." >&2
     exit 1
+fi
+
+# --dry-run stops after the pre-flight plan, before anything is written.
+DRY_RUN=false
+if [[ "${1:-}" == "-n" || "${1:-}" == "--dry-run" ]]; then
+    DRY_RUN=true
+    shift
 fi
 
 # ---------------------------------------------------------------------------
@@ -64,19 +77,66 @@ echo "=== Current disks ==="
 lsblk -d -o NAME,SIZE,TYPE,TRAN,MODEL,SERIAL
 echo
 
-SOURCE="${1:-}"
-TARGET="${2:-}"
+# Accept what the disk list above actually prints. lsblk shows bare kernel
+# names (sda, nvme0n1), so typing "sdc" at the prompt is the obvious thing
+# to do; requiring a full "/dev/sdc" made that a hard failure. Bare names,
+# full paths and /dev/disk/by-id style symlinks are all accepted here and
+# normalized to one canonical node path.
+normalize_device() {
+    local dev="$1" resolved
+    dev="${dev#"${dev%%[![:space:]]*}"}"    # strip leading whitespace
+    dev="${dev%"${dev##*[![:space:]]}"}"    # strip trailing whitespace
+    if [[ -z "$dev" ]]; then
+        return 1
+    fi
+    dev="${dev%/}"                          # strip a trailing slash
+    [[ "$dev" == /* ]] || dev="/dev/$dev"
+    # Resolve symlinks so SOURCE/TARGET comparisons and the confirmation
+    # prompt below all operate on the same canonical path.
+    resolved=$(readlink -f "$dev" 2>/dev/null) || resolved=""
+    if [[ -n "$resolved" ]]; then
+        dev="$resolved"
+    fi
+    printf '%s' "$dev"
+}
 
-if [[ -z "$SOURCE" ]]; then
-    read -rp "Enter SOURCE device (e.g. /dev/sda) - the OLD, smaller, LUKS drive: " SOURCE
-fi
-if [[ -z "$TARGET" ]]; then
-    read -rp "Enter TARGET device (e.g. /dev/sdb) - the NEW, larger, blank drive: " TARGET
-fi
+# Result of the last select_device call.
+DEVICE=""
 
-for dev in "$SOURCE" "$TARGET"; do
-    [[ -b "$dev" ]] || { echo "Not a block device: $dev" >&2; exit 1; }
-done
+select_device() {
+    local role="$1" prompt="$2" value="${3:-}" candidate attempt
+    for attempt in 1 2 3; do
+        if [[ -z "$value" ]]; then
+            if ! read -rp "$prompt" value; then
+                echo >&2
+                echo "No $role device provided. Aborting." >&2
+                exit 1
+            fi
+        fi
+        candidate=$(normalize_device "$value" || true)
+        if [[ -n "$candidate" && -b "$candidate" ]]; then
+            DEVICE="$candidate"
+            return 0
+        fi
+        echo "Not a usable block device: ${candidate:-<empty>}" >&2
+        echo "Pick one of the NAME values listed above, e.g. $(lsblk -dno NAME -e 7,11 2>/dev/null | head -n1)." >&2
+        # A non-interactive run (piped answers, CI) must not spin here.
+        [[ -t 0 ]] || exit 1
+        value=""
+    done
+    echo "Too many invalid entries for $role. Aborting." >&2
+    exit 1
+}
+
+select_device SOURCE \
+    "Enter SOURCE device (e.g. /dev/sda or sda) - the OLD, smaller, LUKS drive: " \
+    "${1:-}"
+SOURCE="$DEVICE"
+
+select_device TARGET \
+    "Enter TARGET device (e.g. /dev/sdb or sdb) - the NEW, larger, blank drive: " \
+    "${2:-}"
+TARGET="$DEVICE"
 
 if [[ "$SOURCE" == "$TARGET" ]]; then
     echo "SOURCE and TARGET must be different devices." >&2
@@ -99,6 +159,85 @@ if (( TGT_SIZE < SRC_SIZE )); then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# 2b. Report the link speed each device is attached on
+# ---------------------------------------------------------------------------
+# A USB enclosure that negotiated a 480M (USB 2.0) link copies at roughly
+# 40 MB/s instead of 400+, turning a six-minute clone into an hour. Nothing
+# in lsblk, dmesg or the copy itself flags it, and the usual cause is a
+# USB 2.0 or charge-only cable, which is physically indistinguishable from
+# a SuperSpeed one. Surface it here rather than leaving it to be worked out
+# halfway through the copy.
+
+# Sets LINK_SPEED (Mbps, empty when the device is not on USB), LINK_DRIVER
+# (uas or usb-storage) and LINK_TRAN (the lsblk transport).
+LINK_SPEED=""
+LINK_DRIVER=""
+LINK_TRAN=""
+
+probe_link() {
+    local dev="$1" sysdir intf drv
+    LINK_SPEED=""
+    LINK_DRIVER=""
+    LINK_TRAN=$(lsblk -dno TRAN "$dev" 2>/dev/null | xargs || true)
+    [[ -z "$LINK_TRAN" ]] && LINK_TRAN="unknown"
+
+    sysdir=$(readlink -f "/sys/block/$(basename "$dev")" 2>/dev/null) || return 0
+    # Walk up to the owning USB device node. Only a USB device directory has
+    # both "speed" and "devnum", so this cannot match a SCSI host or the
+    # block device itself.
+    while [[ -n "$sysdir" && "$sysdir" != "/" ]]; do
+        if [[ -f "$sysdir/speed" && -f "$sysdir/devnum" ]]; then
+            LINK_SPEED=$(cat "$sysdir/speed" 2>/dev/null || true)
+            # uas vs usb-storage is a property of the interface, not the
+            # device. Read the link text rather than resolving it: the target
+            # lives outside this subtree and "readlink -f" yields nothing if
+            # any parent of it is missing.
+            for intf in "$sysdir"/*:*; do
+                if [[ -L "$intf/driver" ]]; then
+                    drv=$(readlink "$intf/driver" 2>/dev/null || true)
+                    LINK_DRIVER="${drv##*/}"
+                    break
+                fi
+            done
+            return 0
+        fi
+        sysdir=$(dirname "$sysdir")
+    done
+    return 0
+}
+
+SLOW_LINKS=""
+for role_dev in "SOURCE:$SOURCE" "TARGET:$TARGET"; do
+    role="${role_dev%%:*}"
+    probe_link "${role_dev#*:}"
+    line="$role link: $LINK_TRAN"
+    [[ -n "$LINK_SPEED" ]] && line="$line, ${LINK_SPEED}M"
+    [[ -n "$LINK_DRIVER" ]] && line="$line, driver=$LINK_DRIVER"
+    echo "$line"
+    # "speed" can read 1.5 or 12 for low/full-speed devices, so compare on
+    # the integer part only and never feed a non-integer to (( )).
+    speed_int="${LINK_SPEED%%.*}"
+    if [[ "$speed_int" =~ ^[0-9]+$ ]] && (( speed_int <= 480 )); then
+        SLOW_LINKS="$SLOW_LINKS $role"
+    fi
+done
+
+if [[ -n "$SLOW_LINKS" ]]; then
+    # 40 MB/s is what USB 2.0 bulk storage realistically sustains; the
+    # protocol ceiling is 53.2 MB/s and nothing reaches it.
+    SLOW_MINUTES=$(( SRC_SIZE / 40000000 / 60 ))
+    echo
+    echo "WARNING:$SLOW_LINKS on a USB 2.0 (480M) link."
+    echo "  USB 2.0 tops out near 40 MB/s, so copying $(numfmt --to=iec "$SRC_SIZE") will take"
+    echo "  roughly $SLOW_MINUTES minutes. On a 5000M/10000M link the same copy takes a"
+    echo "  few minutes."
+    echo "  Most common cause: a USB 2.0 or charge-only cable. Those are physically"
+    echo "  identical to SuperSpeed cables and negotiate 480M with no error anywhere."
+    echo "  Check with 'lsusb -t' and look for 5000M or 10000M on the enclosure."
+    echo "  Swapping the cable now is usually faster than waiting out the copy."
+fi
+
 # Refuse if target (or any of its partitions) is mounted or in active use.
 if lsblk -no MOUNTPOINT "$TARGET" 2>/dev/null | grep -q .; then
     echo "TARGET has a mounted partition. Unmount it first. Aborting." >&2
@@ -107,6 +246,141 @@ fi
 if swapon --show=NAME --noheadings 2>/dev/null | grep -q "^${TARGET}"; then
     echo "TARGET is in use as swap. Aborting." >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 2c. Pre-flight plan
+# ---------------------------------------------------------------------------
+# Everything that decides whether this clone can succeed is knowable from the
+# SOURCE partition table and LUKS header plus the TARGET's size, before a
+# single byte is written. Compute the post-clone geometry here so a problem
+# surfaces now rather than after a destructive copy.
+
+# /dev/sdc + 3 -> /dev/sdc3, but /dev/nvme0n1 + 3 -> /dev/nvme0n1p3.
+partition_path() {
+    local disk="$1" num="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        printf '%sp%s' "$disk" "$num"
+    else
+        printf '%s%s' "$disk" "$num"
+    fi
+}
+
+echo
+echo "=== Pre-flight plan ==="
+
+SRC_SS=$(blockdev --getss "$SOURCE")
+TGT_SS=$(blockdev --getss "$TARGET")
+echo "Logical sector size: source ${SRC_SS}B, target ${TGT_SS}B"
+if (( SRC_SS != TGT_SS )); then
+    echo >&2
+    echo "ERROR: logical sector sizes differ. Every LBA in the copied partition" >&2
+    echo "table would be reinterpreted at the wrong scale on the target, so the" >&2
+    echo "clone would be unreadable. Aborting." >&2
+    exit 1
+fi
+
+echo
+echo "Source partition layout:"
+SRC_LUKS_PART=""
+SRC_LUKS_NUM=""
+SRC_LUKS_START=""
+SRC_LUKS_END=""
+SRC_MAX_END=0
+while read -r pnum pstart pend; do
+    [[ "$pnum" =~ ^[0-9]+$ ]] || continue
+    pdev=$(partition_path "$SOURCE" "$pnum")
+    pfs=$(blkid -s TYPE -o value "$pdev" 2>/dev/null || true)
+    printf '  %-3s %-18s %12s .. %-12s %s\n' \
+        "$pnum" "$pdev" "$pstart" "$pend" "${pfs:-(no signature)}"
+    (( pend > SRC_MAX_END )) && SRC_MAX_END=$pend
+    if [[ "$pfs" == "crypto_LUKS" ]]; then
+        SRC_LUKS_PART="$pdev"
+        SRC_LUKS_NUM="$pnum"
+        SRC_LUKS_START="$pstart"
+        SRC_LUKS_END="$pend"
+    fi
+done < <(sgdisk -p "$SOURCE" 2>/dev/null \
+    | awk '/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+/ {print $1, $2, $3}' || true)
+
+if [[ -z "$SRC_LUKS_PART" ]]; then
+    echo >&2
+    echo "ERROR: no crypto_LUKS partition found on $SOURCE. This script only" >&2
+    echo "handles a LUKS-encrypted source. Aborting." >&2
+    exit 1
+fi
+
+echo
+echo "LUKS partition: $SRC_LUKS_PART (partition $SRC_LUKS_NUM)"
+if (( SRC_LUKS_END != SRC_MAX_END )); then
+    echo >&2
+    echo "ERROR: $SRC_LUKS_PART is not the last partition on $SOURCE (it ends at" >&2
+    echo "$SRC_LUKS_END, the disk's last partition ends at $SRC_MAX_END). Growing it" >&2
+    echo "would run into the partition that follows. Aborting." >&2
+    exit 1
+fi
+echo "  Position: last partition on the disk, so it can be grown."
+
+LUKS_VERSION=$(cryptsetup luksDump "$SRC_LUKS_PART" 2>/dev/null \
+    | sed -n 's/^Version:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -n1 || true)
+LUKS_SECTOR=$(cryptsetup luksDump "$SRC_LUKS_PART" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*sector:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -n1 || true)
+# LUKS1 has no sector field and is always 512.
+[[ "$LUKS_SECTOR" =~ ^[0-9]+$ ]] && (( LUKS_SECTOR > 0 )) || LUKS_SECTOR=512
+echo "  LUKS version: ${LUKS_VERSION:-unknown}, encryption sector: ${LUKS_SECTOR}B"
+
+GRAIN=$(( LUKS_SECTOR / TGT_SS ))
+(( GRAIN > 0 )) || GRAIN=1
+
+# After the copy, sgdisk -e moves the backup GPT to the end of the larger
+# disk. The space it reserves is a property of the partition entry array,
+# which the copy carries over from the source, so measure it there rather
+# than assuming the usual 34 sectors.
+SRC_TOTAL=$(blockdev --getsz "$SOURCE")
+TGT_TOTAL=$(blockdev --getsz "$TARGET")
+SRC_LAST_USABLE=$(sgdisk -p "$SOURCE" 2>/dev/null \
+    | sed -n 's/.*last usable sector is \([0-9]\{1,\}\).*/\1/p' || true)
+if [[ "$SRC_LAST_USABLE" =~ ^[0-9]+$ ]]; then
+    GPT_RESERVE=$(( SRC_TOTAL - SRC_LAST_USABLE ))
+else
+    GPT_RESERVE=34
+fi
+PROJ_LAST_USABLE=$(( TGT_TOTAL - GPT_RESERVE ))
+
+PROJ_SECTORS=$(( PROJ_LAST_USABLE - SRC_LUKS_START + 1 ))
+PROJ_SECTORS=$(( PROJ_SECTORS - PROJ_SECTORS % GRAIN ))
+PROJ_END=$(( SRC_LUKS_START + PROJ_SECTORS - 1 ))
+CUR_SECTORS=$(( SRC_LUKS_END - SRC_LUKS_START + 1 ))
+
+echo
+echo "Projected geometry after the clone and resize:"
+printf '  %-26s %s\n' "partition start"     "$SRC_LUKS_START (unchanged)"
+printf '  %-26s %s\n' "current end"         "$SRC_LUKS_END"
+printf '  %-26s %s\n' "target last usable"  "$PROJ_LAST_USABLE (GPT reserves $GPT_RESERVE sectors)"
+printf '  %-26s %s\n' "new end"             "$PROJ_END (aligned to $GRAIN sectors)"
+printf '  %-26s %s -> %s\n' "partition size" \
+    "$(numfmt --to=iec $(( CUR_SECTORS * TGT_SS )))" \
+    "$(numfmt --to=iec $(( PROJ_SECTORS * TGT_SS )))"
+printf '  %-26s %s bytes\n' "unused tail" "$(( (PROJ_LAST_USABLE - PROJ_END) * TGT_SS ))"
+
+if (( PROJ_SECTORS % GRAIN != 0 )); then
+    echo >&2
+    echo "ERROR: projected size $PROJ_SECTORS is not a multiple of $GRAIN sectors." >&2
+    echo "LUKS would refuse to open the container. Aborting." >&2
+    exit 1
+fi
+if (( PROJ_SECTORS <= CUR_SECTORS )); then
+    echo >&2
+    echo "ERROR: the projected partition would not be larger than the current one." >&2
+    echo "There is nothing to gain from this clone. Aborting." >&2
+    exit 1
+fi
+echo "  Checks: alignment OK, partition grows, LUKS is last."
+
+if $DRY_RUN; then
+    echo
+    echo "Dry run requested (--dry-run). Nothing was written. Stopping here."
+    exit 0
 fi
 
 # Detect whether TARGET already has a partition table or filesystem on it.
@@ -137,8 +411,11 @@ else
 fi
 
 echo
-echo "Type the TARGET device path exactly to confirm it will be ERASED:"
+echo "Type the TARGET device ($TARGET) exactly to confirm it will be ERASED:"
 read -rp "> " CONFIRM
+# Normalized the same way as the selection above, so "nvme0n1" and
+# "/dev/nvme0n1" both match; anything else still aborts.
+CONFIRM=$(normalize_device "$CONFIRM" || true)
 if [[ "$CONFIRM" != "$TARGET" ]]; then
     echo "Confirmation did not match. Aborting." >&2
     exit 1
@@ -154,7 +431,11 @@ read -rp "Proceed with the clone now? [y/N] " GO
 [[ "$GO" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
 
 if command -v pv >/dev/null 2>&1; then
-    pv -tpreb "$SOURCE" | dd of="$TARGET" bs=4M conv=fsync
+    # iflag=fullblock is required when dd reads from a pipe: without it dd
+    # accepts the pipe's short reads (64 KiB) as whole blocks and issues
+    # thousands of small writes instead of 4 MiB ones, roughly halving
+    # throughput on a fast link.
+    pv -tpreb "$SOURCE" | dd of="$TARGET" bs=4M iflag=fullblock conv=fsync
 else
     dd if="$SOURCE" of="$TARGET" bs=4M status=progress conv=fsync
 fi
@@ -198,9 +479,56 @@ echo "This must be the LAST partition on the disk for the resize below to work."
 read -rp "Grow partition $PART_NUM to fill the rest of $TARGET now? [y/N] " GO
 [[ "$GO" =~ ^[Yy]$ ]] || { echo "Stopping before partition resize."; exit 1; }
 
-parted -s "$TARGET" resizepart "$PART_NUM" 100%
+# Do NOT use "resizepart 100%" here. That ends the partition at the last
+# usable LBA, which sits 34 sectors below the end of the disk and so almost
+# never lands on a 4096-byte boundary. dm-crypt rejects any mapping whose
+# length in 512-byte sectors is not a multiple of its sector_size feature,
+# so on a LUKS2 container formatted with a 4096-byte encryption sector the
+# luksOpen further down then fails with:
+#   device-mapper: reload ioctl on ... failed: Invalid argument
+#   The device size is not multiple of the requested sector size.
+# Round the end down to a whole number of encryption sectors instead. The
+# few KB given up at the end of the disk are irrelevant.
+# "|| true" on each of these: under "set -e" with pipefail a failing
+# luksDump or sgdisk would abort the script outright, making the fallback
+# below unreachable.
+LUKS_SECTOR=$(cryptsetup luksDump "$LUKS_PART" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*sector:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -n1 || true)
+# LUKS1 has no sector field and is always 512.
+[[ "$LUKS_SECTOR" =~ ^[0-9]+$ ]] && (( LUKS_SECTOR > 0 )) || LUKS_SECTOR=512
+LOGICAL_SECTOR=$(blockdev --getss "$TARGET")
+GRAIN=$(( LUKS_SECTOR / LOGICAL_SECTOR ))
+(( GRAIN > 0 )) || GRAIN=1
+
+PART_START=$(sgdisk -i "$PART_NUM" "$TARGET" 2>/dev/null \
+    | sed -n 's/^First sector: \([0-9]\{1,\}\).*/\1/p' || true)
+LAST_USABLE=$(sgdisk -p "$TARGET" 2>/dev/null \
+    | sed -n 's/.*last usable sector is \([0-9]\{1,\}\).*/\1/p' || true)
+
+echo "LUKS encryption sector size: ${LUKS_SECTOR} bytes (alignment grain: $GRAIN sectors)"
+
+if [[ "$PART_START" =~ ^[0-9]+$ && "$LAST_USABLE" =~ ^[0-9]+$ ]]; then
+    NEW_SECTORS=$(( LAST_USABLE - PART_START + 1 ))
+    NEW_SECTORS=$(( NEW_SECTORS - NEW_SECTORS % GRAIN ))
+    NEW_END=$(( PART_START + NEW_SECTORS - 1 ))
+    echo "Growing partition $PART_NUM to sectors $PART_START-$NEW_END" \
+         "($(numfmt --to=iec $(( NEW_SECTORS * LOGICAL_SECTOR ))))."
+    parted -s "$TARGET" unit s resizepart "$PART_NUM" "${NEW_END}s"
+else
+    echo "Could not read partition geometry from sgdisk; falling back to 100%." >&2
+    parted -s "$TARGET" resizepart "$PART_NUM" 100%
+fi
 partprobe "$TARGET" || partx -u "$TARGET"
 sleep 2
+
+# Fail loudly here rather than letting luksOpen produce an opaque
+# device-mapper error further down.
+PART_SECTORS=$(blockdev --getsz "$LUKS_PART")
+if (( PART_SECTORS % GRAIN != 0 )); then
+    echo "Partition $LUKS_PART is $PART_SECTORS sectors, not a multiple of $GRAIN." >&2
+    echo "LUKS would refuse to open it. Aborting before any further changes." >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Open and grow the LUKS container
@@ -252,6 +580,24 @@ echo
 echo "Growing filesystem ($FSTYPE) on $TARGET_FS_DEV..."
 case "$FSTYPE" in
     ext2|ext3|ext4)
+        # resize2fs refuses to grow a filesystem whose last check predates
+        # its last mount ("Please run 'e2fsck -f ...' first"), which is true
+        # of every normally used root filesystem: it was checked at install
+        # and mounted on every boot since. The volume is not mounted here,
+        # so a full check is both safe and exactly what resize2fs wants.
+        echo "Checking filesystem first (resize2fs requires it)..."
+        FSCK_RC=0
+        e2fsck -fp "$TARGET_FS_DEV" || FSCK_RC=$?
+        # 0 = clean, 1 = errors corrected, 2 = corrected, reboot advised
+        # (meaningless for an offline volume). 4 and above need a human.
+        if (( FSCK_RC >= 4 )); then
+            echo >&2
+            echo "e2fsck could not repair $TARGET_FS_DEV unattended (exit $FSCK_RC)." >&2
+            echo "Run 'e2fsck -f $TARGET_FS_DEV' by hand, then re-run resize2fs:" >&2
+            echo "  resize2fs $TARGET_FS_DEV" >&2
+            exit 1
+        fi
+        (( FSCK_RC > 0 )) && echo "e2fsck corrected errors (exit $FSCK_RC); continuing."
         resize2fs "$TARGET_FS_DEV"
         ;;
     btrfs)
